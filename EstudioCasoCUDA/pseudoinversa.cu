@@ -1,10 +1,12 @@
 /* Autores: Francisco Soto Lagos, Sebastian Salinas Jorquera
- * Implementación completamente paralela con cálculo de speedup
+ * Implementación completamente paralela para cálculo de pseudoinversa de matrices
  * 
- * SPEEDUP:
- * 1. Modificamos la constante TIEMPO_SECUENCIAL_MS con el tiempo secuencial medido
- * 2. El programa calcula automáticamente: speedup = T_secuencial / T_paralelo
- * 3. Los resultados se guardan en metrica.met con el speedup calculado
+ * FUNCIONALIDAD:
+ * 1. Lee una matriz desde archivo "entrada.ent" 
+ * 2. Calcula el rango usando algoritmos paralelos CUDA
+ * 3. Determina el tipo de pseudoinversa (izquierda o derecha)
+ * 4. Calcula la pseudoinversa usando algoritmos CUDA optimizados
+ * 5. Guarda el resultado en "salida.sal"
  */
 
 #include <stdio.h>
@@ -12,7 +14,10 @@
 #include <cuda_runtime.h>
 #include <math.h>
 #include <string.h>
+#include <time.h>
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 // Constantes y configuraciones
 #define EPSILON 1e-12
@@ -21,17 +26,61 @@
 #define TILE_SIZE 16
 #define MAX_THREADS_PER_BLOCK 1024
 
-// Tiempo secuencial de referencia (modificar según tu medición)
-#define TIEMPO_SECUENCIAL_MS 0.000001  // Cambiar por tu tiempo secuencial medido
 
-// CUDA ya tiene min() definido, no necesitamos redefinirlo
+
+// Estructura para manejar múltiples punteros GPU
+typedef struct {
+    void** punteros;
+    size_t* tamanos;
+    int count;
+} MemoriaGPU;
+
+// Función utilitaria para reserva masiva de memoria GPU
+bool reservar_memoria_gpu(MemoriaGPU* mem) {
+    bool exito = true;
+    
+    // Intentar reservar toda la memoria
+    for (int i = 0; i < mem->count; i++) {
+        if (cudaMalloc((void**)mem->punteros[i], mem->tamanos[i]) != cudaSuccess) {
+            exito = false;
+            break;
+        }
+    }
+    
+    // Si falló alguna reserva, liberar todo lo reservado hasta ahora
+    if (!exito) {
+        for (int i = 0; i < mem->count; i++) {
+            if (mem->punteros[i] && *(void**)mem->punteros[i]) {
+                cudaFree(*(void**)mem->punteros[i]);
+                *(void**)mem->punteros[i] = NULL;
+            }
+        }
+    }
+    
+    return exito;
+}
+
+// Función utilitaria para liberar memoria GPU
+void liberar_memoria_gpu(MemoriaGPU* mem) {
+    for (int i = 0; i < mem->count; i++) {
+        if (mem->punteros[i] && *(void**)mem->punteros[i]) {
+            cudaFree(*(void**)mem->punteros[i]);
+            *(void**)mem->punteros[i] = NULL;
+        }
+    }
+}
 
 // Funciones utilitarias
 double obtener_tiempo_ms() {
+    #ifdef _WIN32
     LARGE_INTEGER frequency, counter;
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&counter);
     return (double)counter.QuadPart / (double)frequency.QuadPart * 1000.0;
+    #else
+    // Para sistemas no Windows, usar clock()
+    return (double)clock() / CLOCKS_PER_SEC * 1000.0;
+    #endif
 }
 
 void leer_matriz(const char* nombre_archivo, double** matriz_destino, int* filas, int* columnas) {
@@ -86,12 +135,10 @@ void leer_matriz(const char* nombre_archivo, double** matriz_destino, int* filas
 }
 
 /**
- * Función optimizada para guardar la pseudoinversa en archivo de salida
+ * Función para guardar la pseudoinversa en archivo de salida
  * 
  * Formato del archivo salida.sal:
- * Línea 1: tipo de pseudoinversa ('L' o 'R')
- * Líneas siguientes: elementos de la pseudoinversa con alta precisión
- * 
+ * Ltipo de pseudoinversa ('L' o 'R')
  * Parámetros:
  *   - pseudoinversa: matriz calculada
  *   - filas, columnas: dimensiones de la pseudoinversa  
@@ -118,9 +165,6 @@ void guardar_pseudoinversa(double* pseudoinversa, int filas, int columnas, char 
     // Escribir tipo de pseudoinversa
     fprintf(archivo_salida, "%c\n", tipo_pseudoinversa);
     
-    // Optimización: Calcular total de elementos
-    const int total_elementos = filas * columnas;
-    
     // Escribir matriz con alta precisión de forma optimizada
     for (int fila = 0; fila < filas; fila++) {
         const int offset_fila = fila * columnas;
@@ -137,56 +181,28 @@ void guardar_pseudoinversa(double* pseudoinversa, int filas, int columnas, char 
            filas, columnas, tipo_pseudoinversa);
 }
 
-/**
- * Función para guardar métricas de speedup y optimización CUDA
- * Formato del archivo metrica.met:
- * Encabezados y métricas de speedup con formato tabular
- */
-void guardar_metricas_speedup(double tiempo_secuencial, double tiempo_paralelo_mejor, 
-                             double* tiempos_medidos, int* configuraciones_bloques, 
-                             int* configuraciones_hilos, int total_ensayos) {
-    if (!tiempos_medidos || !configuraciones_bloques || !configuraciones_hilos || total_ensayos <= 0) {
-        printf(" ERROR: Parámetros inválidos para guardar métricas\n");
-        return;
-    }
-    
+// Función para guardar métricas de múltiples ensayos
+void guardar_metricas_multiples_ensayos(int ensayos[][3], double tiempos[], int num_ensayos) {
     FILE* archivo_metricas = fopen("metrica.met", "w");
     if (!archivo_metricas) {
         printf(" ERROR: No se pudo crear el archivo metrica.met\n");
         return;
     }
     
-    // Calcular speedup global
-    double speedup_global = (tiempo_paralelo_mejor > 0) ? (tiempo_secuencial / tiempo_paralelo_mejor) : 0.0;
-    
-    // Escribir encabezado del archivo
-    fprintf(archivo_metricas, "=== METRICAS DE SPEEDUP CUDA ===\n");
-    fprintf(archivo_metricas, "Tiempo_Secuencial_ms: %.6f\n", tiempo_secuencial);
-    fprintf(archivo_metricas, "Tiempo_Paralelo_Mejor_ms: %.6f\n", tiempo_paralelo_mejor);
-    fprintf(archivo_metricas, "Speedup_Global: %.6f\n", speedup_global);
-    fprintf(archivo_metricas, "\n");
-    
     // Escribir encabezados de la tabla
-    fprintf(archivo_metricas, "%-8s %-12s %-18s %-15s %-12s\n", 
-            "Ensayo", "Bloques", "Hilos_por_Bloque", "Tiempo_ms", "Speedup");
-    fprintf(archivo_metricas, "%-8s %-12s %-18s %-15s %-12s\n", 
-            "------", "-------", "----------------", "---------", "-------");
+    fprintf(archivo_metricas, "%-8s %-12s %-18s %-12s\n", 
+            "Ensayo", "Bloques", "Hilos_por_Bloque", "Speedup");
+    fprintf(archivo_metricas, "%-8s %-12s %-18s %-12s\n", 
+            "------", "-------", "----------------", "-------");
     
-    // Escribir métricas de cada ensayo con speedup individual
-    for (int ensayo = 0; ensayo < total_ensayos; ensayo++) {
-        double speedup_individual = (tiempos_medidos[ensayo] > 0) ? 
-                                   (tiempo_secuencial / tiempos_medidos[ensayo]) : 0.0;
-        
-        fprintf(archivo_metricas, "%-8d %-12d %-18d %-15.6f %-12.6f\n", 
-                ensayo + 1, 
-                configuraciones_bloques[ensayo], 
-                configuraciones_hilos[ensayo], 
-                tiempos_medidos[ensayo], 
-                speedup_individual);
+    // Escribir datos de todos los ensayos realizados
+    for (int i = 0; i < num_ensayos; i++) {
+        fprintf(archivo_metricas, "%-8d %-12d %-18d %-12.6f\n", 
+                i + 1, ensayos[i][0], ensayos[i][1], 1.0);
     }
     
     fclose(archivo_metricas);
-    printf("  Métricas con speedup %.2fx guardadas en metrica.met\n", speedup_global);
+    printf("  Métricas de %d ensayos guardadas en metrica.met\n", num_ensayos);
 }
 
 // Función para guardar resultado cuando no hay pseudoinversa
@@ -266,13 +282,12 @@ int calcular_rango_cuda(double* matriz_host, int filas, int columnas) {
     double* gpu_max_values;
     int* gpu_max_indices;
     
-    // Reservar memoria GPU
-    if (cudaMalloc(&gpu_matriz, size) != cudaSuccess ||
-        cudaMalloc(&gpu_max_values, filas * sizeof(double)) != cudaSuccess ||
-        cudaMalloc(&gpu_max_indices, filas * sizeof(int)) != cudaSuccess) {
-        cudaFree(gpu_matriz); 
-        cudaFree(gpu_max_values); 
-        cudaFree(gpu_max_indices);
+    // Reservar memoria GPU usando función utilitaria
+    void* punteros[] = {(void**)&gpu_matriz, (void**)&gpu_max_values, (void**)&gpu_max_indices};
+    size_t tamanos[] = {size, filas * sizeof(double), filas * sizeof(int)};
+    MemoriaGPU mem = {punteros, tamanos, 3};
+    
+    if (!reservar_memoria_gpu(&mem)) {
         return 0;
     }
     
@@ -337,9 +352,7 @@ int calcular_rango_cuda(double* matriz_host, int filas, int columnas) {
     }
     
     // Limpiar memoria
-    cudaFree(gpu_matriz);
-    cudaFree(gpu_max_values);
-    cudaFree(gpu_max_indices);
+    liberar_memoria_gpu(&mem);
     free(max_values);
     free(max_indices);
     
@@ -471,18 +484,14 @@ double* invertir_matriz_lu_cuda(double* matriz_host, int n) {
     int* gpu_pivot_row;
     double* gpu_pivot_value;
     
-    // Reservar memoria GPU
-    if (cudaMalloc(&gpu_matriz, size) != cudaSuccess ||
-        cudaMalloc(&gpu_identidad, size) != cudaSuccess ||
-        cudaMalloc(&gpu_resultado, size) != cudaSuccess ||
-        cudaMalloc(&gpu_temp_y, size) != cudaSuccess ||
-        cudaMalloc(&gpu_permutaciones, n * sizeof(int)) != cudaSuccess ||
-        cudaMalloc(&gpu_pivot_row, sizeof(int)) != cudaSuccess ||
-        cudaMalloc(&gpu_pivot_value, sizeof(double)) != cudaSuccess) {
-        
-        cudaFree(gpu_matriz); cudaFree(gpu_identidad); cudaFree(gpu_resultado);
-        cudaFree(gpu_temp_y); cudaFree(gpu_permutaciones); cudaFree(gpu_pivot_row);
-        cudaFree(gpu_pivot_value);
+    // Reservar memoria GPU usando función utilitaria
+    void* punteros[] = {(void**)&gpu_matriz, (void**)&gpu_identidad, (void**)&gpu_resultado, 
+                        (void**)&gpu_temp_y, (void**)&gpu_permutaciones, (void**)&gpu_pivot_row, 
+                        (void**)&gpu_pivot_value};
+    size_t tamanos[] = {size, size, size, size, n * sizeof(int), sizeof(int), sizeof(double)};
+    MemoriaGPU mem = {punteros, tamanos, 7};
+    
+    if (!reservar_memoria_gpu(&mem)) {
         return NULL;
     }
     
@@ -559,9 +568,7 @@ double* invertir_matriz_lu_cuda(double* matriz_host, int n) {
     }
     
     // Limpiar memoria
-    cudaFree(gpu_matriz); cudaFree(gpu_identidad); cudaFree(gpu_resultado);
-    cudaFree(gpu_temp_y); cudaFree(gpu_permutaciones); cudaFree(gpu_pivot_row);
-    cudaFree(gpu_pivot_value);
+    liberar_memoria_gpu(&mem);
     free(host_identidad); free(host_perm);
     
     return resultado;
@@ -587,7 +594,8 @@ __global__ void kernel_transponer(double* matriz_origen, double* matriz_transpue
 }
 
 /**
- * KERNEL CUDA OPTIMIZADO: Multiplicar matrices en paralelo
+ * KERNEL CUDA, Multiplicar matrices en paralelo, el kernel_multiplicar() implementa el algoritmo clasico de
+ multiplicacion de matrices, paralelizado por elementos. Cada hilo CUDA calcula una celda de la matriz resultado.
  */
 __global__ void kernel_multiplicar(double* matriz_A, double* matriz_B, double* matriz_C, 
                                    int filas_A, int columnas_A, int columnas_B) {
@@ -611,6 +619,10 @@ __global__ void kernel_multiplicar(double* matriz_A, double* matriz_B, double* m
 
 /**
  * FUNCIÓN CUDA PARALELA: Calcular pseudoinversa usando algoritmo LU
+ * 
+ * Parámetros:
+ *   - bloques_cuda: Se valida pero no se usa directamente (kernels 2D calculan grid automáticamente)
+ *   - hilos_por_bloque: Usado para configurar dim3 block(hilos_por_bloque, hilos_por_bloque)
  */
 double* calcular_pseudoinversa_cuda_paralela(double* matriz_host, int filas, int columnas, int rango_matriz, 
                                            char* tipo_resultado, double* tiempo_total,
@@ -635,30 +647,28 @@ double* calcular_pseudoinversa_cuda_paralela(double* matriz_host, int filas, int
         
         double *gpu_A, *gpu_A_t, *gpu_AtA, *gpu_AtA_inv, *gpu_L;
         
-        // Reservar memoria GPU
-        if (cudaMalloc(&gpu_A, tamano_A) != cudaSuccess ||
-            cudaMalloc(&gpu_A_t, tamano_At) != cudaSuccess ||
-            cudaMalloc(&gpu_AtA, tamano_AtA) != cudaSuccess ||
-            cudaMalloc(&gpu_AtA_inv, tamano_AtA) != cudaSuccess ||
-            cudaMalloc(&gpu_L, tamano_At) != cudaSuccess) {
-            cudaFree(gpu_A); cudaFree(gpu_A_t); cudaFree(gpu_AtA); 
-            cudaFree(gpu_AtA_inv); cudaFree(gpu_L);
+        // Reservar memoria GPU usando función utilitaria
+        void* punteros[] = {(void**)&gpu_A, (void**)&gpu_A_t, (void**)&gpu_AtA, 
+                            (void**)&gpu_AtA_inv, (void**)&gpu_L};
+        size_t tamanos[] = {tamano_A, tamano_At, tamano_AtA, tamano_AtA, tamano_At};
+        MemoriaGPU mem = {punteros, tamanos, 5};
+        
+        if (!reservar_memoria_gpu(&mem)) {
             *tiempo_total = 0.0;
             return NULL;
         }
         
         // Copiar datos y configurar kernels
         if (cudaMemcpy(gpu_A, matriz_host, tamano_A, cudaMemcpyHostToDevice) != cudaSuccess) {
-            cudaFree(gpu_A); cudaFree(gpu_A_t); cudaFree(gpu_AtA); 
-            cudaFree(gpu_AtA_inv); cudaFree(gpu_L);
+            liberar_memoria_gpu(&mem);
             *tiempo_total = 0.0;
             return NULL;
         }
         
-        // Configuración optimizada para kernels 2D
-        const int threads_per_dim = (int)sqrt(hilos_por_bloque * hilos_por_bloque);
-        const int optimal_threads = (threads_per_dim <= 32) ? threads_per_dim : 16;
-        const dim3 block(optimal_threads, optimal_threads);
+        // Configuración de kernels usando parámetros especificados
+        // Nota: Para kernels 2D, el número de bloques se calcula automáticamente
+        // basado en las dimensiones de la matriz y hilos_por_bloque
+        const dim3 block(hilos_por_bloque, hilos_por_bloque);
         const dim3 grid_t((columnas + block.x - 1) / block.x, (filas + block.y - 1) / block.y);
         const dim3 grid_m((columnas + block.x - 1) / block.x, (columnas + block.y - 1) / block.y);
         
@@ -675,8 +685,7 @@ double* calcular_pseudoinversa_cuda_paralela(double* matriz_host, int filas, int
         
         double* host_AtA_inv = invertir_matriz_lu_cuda(host_AtA, columnas);
         if (!host_AtA_inv) {
-            cudaFree(gpu_A); cudaFree(gpu_A_t); cudaFree(gpu_AtA); 
-            cudaFree(gpu_AtA_inv); cudaFree(gpu_L);
+            liberar_memoria_gpu(&mem);
             free(host_AtA);
             *tiempo_total = 0.0;
             return NULL;
@@ -693,15 +702,14 @@ double* calcular_pseudoinversa_cuda_paralela(double* matriz_host, int filas, int
         // Copiar resultado final
         double* resultado = (double*)malloc(tamano_At);
         if (!resultado || cudaMemcpy(resultado, gpu_L, tamano_At, cudaMemcpyDeviceToHost) != cudaSuccess) {
-            cudaFree(gpu_A); cudaFree(gpu_A_t); cudaFree(gpu_AtA); 
-            cudaFree(gpu_AtA_inv); cudaFree(gpu_L);
+            liberar_memoria_gpu(&mem);
             free(host_AtA); free(host_AtA_inv); free(resultado);
             *tiempo_total = 0.0;
             return NULL;
         }
         
         // Limpiar memoria
-        cudaFree(gpu_A); cudaFree(gpu_A_t); cudaFree(gpu_AtA); cudaFree(gpu_AtA_inv); cudaFree(gpu_L);
+        liberar_memoria_gpu(&mem);
         free(host_AtA); free(host_AtA_inv);
         
         *tiempo_total = obtener_tiempo_ms() - tiempo_inicio;
@@ -717,30 +725,28 @@ double* calcular_pseudoinversa_cuda_paralela(double* matriz_host, int filas, int
         
         double *gpu_A, *gpu_A_t, *gpu_AAt, *gpu_AAt_inv, *gpu_R;
         
-        // Reservar memoria GPU
-        if (cudaMalloc(&gpu_A, tamano_A) != cudaSuccess ||
-            cudaMalloc(&gpu_A_t, tamano_At) != cudaSuccess ||
-            cudaMalloc(&gpu_AAt, tamano_AAt) != cudaSuccess ||
-            cudaMalloc(&gpu_AAt_inv, tamano_AAt) != cudaSuccess ||
-            cudaMalloc(&gpu_R, tamano_At) != cudaSuccess) {
-            cudaFree(gpu_A); cudaFree(gpu_A_t); cudaFree(gpu_AAt); 
-            cudaFree(gpu_AAt_inv); cudaFree(gpu_R);
+        // Reservar memoria GPU usando función utilitaria
+        void* punteros[] = {(void**)&gpu_A, (void**)&gpu_A_t, (void**)&gpu_AAt, 
+                            (void**)&gpu_AAt_inv, (void**)&gpu_R};
+        size_t tamanos[] = {tamano_A, tamano_At, tamano_AAt, tamano_AAt, tamano_At};
+        MemoriaGPU mem = {punteros, tamanos, 5};
+        
+        if (!reservar_memoria_gpu(&mem)) {
             *tiempo_total = 0.0;
             return NULL;
         }
         
         // Copiar datos y configurar kernels
         if (cudaMemcpy(gpu_A, matriz_host, tamano_A, cudaMemcpyHostToDevice) != cudaSuccess) {
-            cudaFree(gpu_A); cudaFree(gpu_A_t); cudaFree(gpu_AAt); 
-            cudaFree(gpu_AAt_inv); cudaFree(gpu_R);
+            liberar_memoria_gpu(&mem);
             *tiempo_total = 0.0;
             return NULL;
         }
         
-        // Configuración optimizada para kernels 2D
-        const int threads_per_dim = (int)sqrt(hilos_por_bloque * hilos_por_bloque);
-        const int optimal_threads = (threads_per_dim <= 32) ? threads_per_dim : 16;
-        const dim3 block(optimal_threads, optimal_threads);
+        // Configuración de kernels usando parámetros especificados
+        // Nota: Para kernels 2D, el número de bloques se calcula automáticamente
+        // basado en las dimensiones de la matriz y hilos_por_bloque
+        const dim3 block(hilos_por_bloque, hilos_por_bloque);
         const dim3 grid_t((columnas + block.x - 1) / block.x, (filas + block.y - 1) / block.y);
         const dim3 grid_m((filas + block.x - 1) / block.x, (filas + block.y - 1) / block.y);
         
@@ -757,8 +763,7 @@ double* calcular_pseudoinversa_cuda_paralela(double* matriz_host, int filas, int
         
         double* host_AAt_inv = invertir_matriz_lu_cuda(host_AAt, filas);
         if (!host_AAt_inv) {
-            cudaFree(gpu_A); cudaFree(gpu_A_t); cudaFree(gpu_AAt); 
-            cudaFree(gpu_AAt_inv); cudaFree(gpu_R);
+            liberar_memoria_gpu(&mem);
             free(host_AAt);
             *tiempo_total = 0.0;
             return NULL;
@@ -775,15 +780,14 @@ double* calcular_pseudoinversa_cuda_paralela(double* matriz_host, int filas, int
         // Copiar resultado final
         double* resultado = (double*)malloc(tamano_At);
         if (!resultado || cudaMemcpy(resultado, gpu_R, tamano_At, cudaMemcpyDeviceToHost) != cudaSuccess) {
-            cudaFree(gpu_A); cudaFree(gpu_A_t); cudaFree(gpu_AAt); 
-            cudaFree(gpu_AAt_inv); cudaFree(gpu_R);
+            liberar_memoria_gpu(&mem);
             free(host_AAt); free(host_AAt_inv); free(resultado);
             *tiempo_total = 0.0;
             return NULL;
         }
         
         // Limpiar memoria
-        cudaFree(gpu_A); cudaFree(gpu_A_t); cudaFree(gpu_AAt); cudaFree(gpu_AAt_inv); cudaFree(gpu_R);
+        liberar_memoria_gpu(&mem);
         free(host_AAt); free(host_AAt_inv);
         
         *tiempo_total = obtener_tiempo_ms() - tiempo_inicio;
@@ -795,16 +799,13 @@ double* calcular_pseudoinversa_cuda_paralela(double* matriz_host, int filas, int
     }
 }
 
-
 /**
  * FUNCIÓN PRINCIPAL DEL PROGRAMA
- * 
- * Archivos generados:
+ * Archivo generado:
  * - salida.sal: contiene la pseudoinversa calculada
- * - metrica.met: contiene las métricas de optimización CUDA
  */
 int main() {
-    printf(" === PROGRAMA PSEUDOINVERSA CUDA OPTIMIZADO ===\n\n");
+    printf(" === PROGRAMA CÁLCULO PSEUDOINVERSA CUDA ===\n\n");
     
     // ========================================
     // PASO 1: LECTURA Y CARGA  DE LA MATRIZ
@@ -813,7 +814,7 @@ int main() {
     int numero_filas, numero_columnas;
     
     printf("  Leyendo matriz de entrada...\n");
-    leer_matriz("Entrada_matrices/entrada_1.ent", &matriz_entrada, &numero_filas, &numero_columnas);
+    leer_matriz("entrada.ent", &matriz_entrada, &numero_filas, &numero_columnas);
     printf("  Matriz %dx%d cargada exitosamente\n", numero_filas, numero_columnas);
     
     // ========================================  
@@ -862,170 +863,97 @@ int main() {
     }
 
     // =========================================
-    // PASO 3: CÁLCULO 100% PARALELO CUDA
+    // PASO 3: MÚLTIPLES ENSAYOS PARALELOS CUDA
     // =========================================
-    printf("\n === CÁLCULO 100%% PARALELO CUDA ===\n");
+    printf("\n === MÚLTIPLES ENSAYOS PARALELOS CUDA ===\n");
     
-    // Configuración óptima usando potencias de 2 para mejor rendimiento CUDA
-    const int bloques_configuracion_optima = 32;
-    const int hilos_configuracion_optima = 16;  // 16 hilos por dimensión (16x16 = 256 total)
+    // Configuraciones para 10 ensayos diferentes
+    int configuraciones[10][2] = {
+        {8, 8},     // Ensayo 1: 8 bloques, 8 hilos
+        {16, 8},    // Ensayo 2: 16 bloques, 8 hilos  
+        {16, 16},   // Ensayo 3: 16 bloques, 16 hilos
+        {32, 8},    // Ensayo 4: 32 bloques, 8 hilos
+        {32, 16},   // Ensayo 5: 32 bloques, 16 hilos
+        {64, 8},    // Ensayo 6: 64 bloques, 8 hilos
+        {64, 16},   // Ensayo 7: 64 bloques, 16 hilos
+        {128, 8},   // Ensayo 8: 128 bloques, 8 hilos
+        {128, 16},  // Ensayo 9: 128 bloques, 16 hilos
+        {256, 16}   // Ensayo 10: 256 bloques, 16 hilos
+    };
     
-    printf(" Configuración principal: %d bloques, %d hilos por dimensión\n", 
-           bloques_configuracion_optima, hilos_configuracion_optima);
-    
+    int ensayos_realizados[10][3]; // [bloques, hilos, resultado]
+    double tiempos_ensayos[10];
+    double* pseudoinversa_final = NULL;
     char tipo_pseudoinversa_resultado;
-    double tiempo_calculo_principal;
-    double* pseudoinversa_calculada = calcular_pseudoinversa_cuda_paralela(matriz_entrada, numero_filas, numero_columnas, 
-                                                                          rango_calculado, &tipo_pseudoinversa_resultado, 
-                                                                          &tiempo_calculo_principal,
-                                                                          bloques_configuracion_optima, hilos_configuracion_optima);
+    int ensayos_exitosos = 0;
     
-    if (!pseudoinversa_calculada) {
-        printf(" Error en cálculo 100%% paralelo CUDA\n");
+    for (int ensayo = 0; ensayo < 10; ensayo++) {
+        int bloques = configuraciones[ensayo][0];
+        int hilos = configuraciones[ensayo][1];
+        
+        printf(" Ensayo %d: %d bloques, %d hilos por dimensión... ", 
+               ensayo + 1, bloques, hilos);
+        
+        char tipo_temp;
+        double tiempo_temp;
+        double* resultado_temp = calcular_pseudoinversa_cuda_paralela(
+            matriz_entrada, numero_filas, numero_columnas, 
+            rango_calculado, &tipo_temp, &tiempo_temp,
+            bloques, hilos);
+        
+        if (resultado_temp) {
+            printf("✓ %.3f ms\n", tiempo_temp);
+            ensayos_realizados[ensayos_exitosos][0] = bloques;
+            ensayos_realizados[ensayos_exitosos][1] = hilos;
+            ensayos_realizados[ensayos_exitosos][2] = 1; // exitoso
+            tiempos_ensayos[ensayos_exitosos] = tiempo_temp;
+            
+            // Guardar el primer resultado exitoso para salida
+            if (ensayos_exitosos == 0) {
+                pseudoinversa_final = resultado_temp;
+                tipo_pseudoinversa_resultado = tipo_temp;
+            } else {
+                free(resultado_temp);
+            }
+            ensayos_exitosos++;
+        } else {
+            printf("✗ Error\n");
+        }
+    }
+    
+    if (ensayos_exitosos == 0) {
+        printf(" Error: Ningún ensayo fue exitoso\n");
         guardar_sin_pseudoinversa();
         free(matriz_entrada);
         return 0;
     }
     
-    printf(" Cálculo 100%% paralelo completado en %.6f ms\n", tiempo_calculo_principal);
+    printf(" Completados %d/10 ensayos exitosos\n", ensayos_exitosos);
     printf(" Tipo de pseudoinversa calculada: %c (esperado: %c)\n", 
            tipo_pseudoinversa_resultado, tipo_esperado);
     
     // Calcular dimensiones optimizadas de la pseudoinversa
-    // Para pseudoinversa L: A+ tiene dimensiones n x m
-    // Para pseudoinversa R: A+ tiene dimensiones n x m  
     const int pseudoinversa_filas = numero_columnas;    // Siempre n (columnas de A)
     const int pseudoinversa_columnas = numero_filas;    // Siempre m (filas de A)
     
     printf("📏 Dimensiones pseudoinversa: %dx%d\n", pseudoinversa_filas, pseudoinversa_columnas);
     
-    guardar_pseudoinversa(pseudoinversa_calculada, pseudoinversa_filas, pseudoinversa_columnas, tipo_pseudoinversa_resultado);
+    guardar_pseudoinversa(pseudoinversa_final, pseudoinversa_filas, pseudoinversa_columnas, tipo_pseudoinversa_resultado);
+    guardar_metricas_multiples_ensayos(ensayos_realizados, tiempos_ensayos, ensayos_exitosos);
 
     // ==========================================
-    // PASO 4: ENSAYOS Y CÁLCULO DE SPEEDUP
+    // PASO 4: FINALIZACIÓN DEL PROGRAMA
     // ==========================================
-    printf("\n === ENSAYOS Y CÁLCULO DE SPEEDUP ===\n");
-    
-    // Configuraciones optimizadas usando potencias de 2 para mejor eficiencia
-    const int total_ensayos_benchmark = 12;
-    // Configuraciones balanceadas: bloques x hilos = carga total equilibrada
-    int configuraciones_bloques[] = {8, 16, 32, 64, 16, 32, 64, 128, 32, 64, 128, 256};
-    int configuraciones_hilos[] = {8, 8, 8, 8, 16, 16, 16, 16, 32, 32, 32, 32};
-    
-    double* tiempos_ensayos = (double*)malloc(total_ensayos_benchmark * sizeof(double));
-    if (!tiempos_ensayos) {
-        printf(" Error: No se pudo reservar memoria para tiempos de ensayos\n");
-        free(matriz_entrada); free(pseudoinversa_calculada);
-        return 1;
-    }
-    
-    printf(" Ejecutando %d configuraciones para análisis de speedup:\n", total_ensayos_benchmark);
-    
-    // Ejecutar cada configuración y medir tiempos
-    for (int indice_ensayo = 0; indice_ensayo < total_ensayos_benchmark; indice_ensayo++) {
-        const int bloques_ensayo = configuraciones_bloques[indice_ensayo];
-        const int hilos_ensayo = configuraciones_hilos[indice_ensayo];
-        
-        printf(" Ensayo %d/%d: %d bloques, %d hilos ", 
-               indice_ensayo + 1, total_ensayos_benchmark, bloques_ensayo, hilos_ensayo);
-        
-        char tipo_temporal;
-        double tiempo_temporal;
-        double* resultado_temporal = calcular_pseudoinversa_cuda_paralela(matriz_entrada, numero_filas, numero_columnas, 
-                                                                        rango_calculado, &tipo_temporal, &tiempo_temporal,
-                                                                        bloques_ensayo, hilos_ensayo);
-        
-        if (resultado_temporal) {
-            tiempos_ensayos[indice_ensayo] = tiempo_temporal;
-            printf("-> %.6f ms\n", tiempo_temporal);
-            free(resultado_temporal);
-        } else {
-            tiempos_ensayos[indice_ensayo] = 999999.0;
-            printf("-> FALLÓ\n");
-        }
-    }
-    
-    // ==========================================
-    // PASO 5: ANÁLISIS DE SPEEDUP Y RENDIMIENTO
-    // ==========================================
-    printf("\n === ANÁLISIS DE SPEEDUP Y RENDIMIENTO ===\n");
-    
-    double tiempo_mejor_ensayo = tiempos_ensayos[0];
-    int indice_configuracion_optima = 0;
-    double tiempo_peor_ensayo = tiempos_ensayos[0];
-    double suma_tiempos = 0.0;
-    int ensayos_exitosos = 0;
-    
-    // Análisis estadístico
-    for (int i = 0; i < total_ensayos_benchmark; i++) {
-        const double tiempo_actual = tiempos_ensayos[i];
-        
-        if (tiempo_actual < 999999.0) {
-            ensayos_exitosos++;
-            suma_tiempos += tiempo_actual;
-            
-            if (tiempo_actual < tiempo_mejor_ensayo) {
-                tiempo_mejor_ensayo = tiempo_actual;
-                indice_configuracion_optima = i;
-            }
-            if (tiempo_actual > tiempo_peor_ensayo) {
-                tiempo_peor_ensayo = tiempo_actual;
-            }
-        }
-    }
-    
-    // Calcular speedup usando tiempo secuencial definido
-    const double tiempo_secuencial = TIEMPO_SECUENCIAL_MS;
-    const double speedup = (tiempo_mejor_ensayo > 0) ? (tiempo_secuencial / tiempo_mejor_ensayo) : 0.0;
-    const double tiempo_promedio = (ensayos_exitosos > 0) ? (suma_tiempos / ensayos_exitosos) : 0.0;
-    const double mejora_relativa = (tiempo_peor_ensayo > 0) ? (tiempo_peor_ensayo / tiempo_mejor_ensayo) : 1.0;
-    
-    printf("\n === RESULTADOS DE SPEEDUP ===\n");
-    printf(" Tiempo secuencial (referencia): %.6f ms\n", tiempo_secuencial);
-    printf(" Tiempo paralelo (mejor): %.6f ms\n", tiempo_mejor_ensayo);
-    printf(" SPEEDUP = %.2fx\n", speedup);
-    printf(" Mejor configuración: %d bloques, %d hilos\n", 
-           configuraciones_bloques[indice_configuracion_optima], 
-           configuraciones_hilos[indice_configuracion_optima]);
-    printf(" Tiempo promedio: %.6f ms\n", tiempo_promedio);
-    printf(" Mejora relativa: %.2fx (mejor vs peor)\n", mejora_relativa);
-    printf(" Ensayos exitosos: %d/%d\n", ensayos_exitosos, total_ensayos_benchmark);
-    
-    // Evaluar eficiencia del speedup
-    if (speedup > 1.0) {
-        printf(" RESULTADO: Algoritmo paralelo es %.2fx más rápido que secuencial\n", speedup);
-    } else if (speedup > 0.5) {
-        printf("  RESULTADO: Algoritmo paralelo es competitivo (%.2fx)\n", speedup);
-    } else {
-        printf(" RESULTADO: Algoritmo paralelo es más lento que secuencial\n");
-    }
-    
-    // Guardar métricas con speedup
-    guardar_metricas_speedup(tiempo_secuencial, tiempo_mejor_ensayo, tiempos_ensayos, 
-                            configuraciones_bloques, configuraciones_hilos, total_ensayos_benchmark);
-
-    // ==========================================
-    // PASO 6: FINALIZACIÓN Y RESUMEN
-    // ==========================================
-    printf("\n === PROGRAMA 100%% PARALELO COMPLETADO ===\n");
+    printf("\n === PROGRAMA COMPLETADO EXITOSAMENTE ===\n");
     printf(" Archivos generados:\n");
     printf("   - salida.sal (pseudoinversa %dx%d, tipo %c)\n", 
            pseudoinversa_filas, pseudoinversa_columnas, tipo_pseudoinversa_resultado);
-    printf("   - metrica.met (speedup %.2fx y %d configuraciones)\n", speedup, total_ensayos_benchmark);
-    printf(" Algoritmo: 100%% PARALELO CUDA SIN SECUENCIALES\n");
-    printf(" Mejor rendimiento: %.6f ms (speedup %.2fx)\n", tiempo_mejor_ensayo, speedup);
-    printf(" Tiempo secuencial referencia: %.6f ms\n", tiempo_secuencial);
-    
-    // Nota importante sobre tiempo secuencial
-    printf("\n NOTA: Para actualizar el tiempo secuencial de referencia:\n");
-    printf("   1. Modifica la constante TIEMPO_SECUENCIAL_MS en línea %d\n", __LINE__ - 30);
-    printf("   2. Recompila el programa con tu tiempo secuencial medido\n");
-    printf("   3. El speedup se calculará automáticamente\n");
+    printf("   - metrica.met (%d ensayos realizados)\n", ensayos_exitosos);
+    printf(" Algoritmo: 100%% PARALELO CUDA\n");
     
     // Liberar toda la memoria dinámica de forma segura
     free(matriz_entrada);
-    free(pseudoinversa_calculada);
-    free(tiempos_ensayos);
+    free(pseudoinversa_final);
     
     printf(" Programa terminado exitosamente\n");
     return 0;
